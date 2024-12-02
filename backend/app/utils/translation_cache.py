@@ -452,3 +452,36 @@ class TranslationCache:
         elif target_lang:
             return f"{self.redis_prefix}*:{target_lang}:*"
         return f"{self.redis_prefix}*"
+    
+
+    async def cleanup(self):
+        """Clean up translation cache resources"""
+        try:
+            # Clear Redis cache
+            if self.redis_client is not None:
+                pattern = f"{self.redis_prefix}*"
+                async for key in self.redis_client.scan_iter(pattern):
+                    await self.redis_client.delete(key)
+                logger.info("Redis translation cache cleared")
+                
+            # Clear MongoDB cache - Fixed comparison
+            if self.translations_collection is not None:
+                result = await self.translations_collection.delete_many({})
+                logger.info(f"MongoDB translation cache cleared: {result.deleted_count} entries removed")
+                
+            # Reset statistics
+            self.stats = defaultdict(int)
+            self.last_cleanup = datetime.utcnow()
+            
+            # Reset initialization state
+            self._initialized = False
+            self.redis_client = None
+            self.mongodb = None
+            self.translations_collection = None
+            
+            logger.info("Translation cache cleanup completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Translation cache cleanup error: {str(e)}")
+            raise RuntimeError(f"Translation cache cleanup failed: {str(e)}")
+

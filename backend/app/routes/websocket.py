@@ -11,9 +11,10 @@ from app.utils.speech_processor import SpeechProcessor, ProcessedSpeech
 from app.services.chat_service import ChatService
 from app.utils.response_validator import AIResponseValidator
 from app.config.language_metadata import LanguageMetadata
-from app.config.database import redis_client, DatabaseConfig
+from app.config.database import redis_client, DatabaseConfig, consultations_collection
 from app.utils.serializers import StreamingStateSerializer
 from typing import Union
+import os
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -126,6 +127,11 @@ class ConnectionManager:
         self.speech_processor = SpeechProcessor()
         self.chat_service = ChatService()
         self.response_validator = AIResponseValidator()
+
+        # Database clients
+        self.db_config = None
+        self.mongodb = None
+        self.redis = None
         
         # Connection tracking
         self.active_connections: Dict[str, ConnectionState] = {}
@@ -144,7 +150,7 @@ class ConnectionManager:
         }
         
         # Redis configuration
-        self.redis_prefix = "ws_session:"
+        self.redis_prefix = "consultation:"
         self.cache_ttl = 3600  # 1 hour
         
         # State tracking
@@ -194,6 +200,15 @@ class ConnectionManager:
                 await db_config.initialize()
                 await db_config._initialized.wait()
                 
+                # Get MongoDB client and collection
+                mongodb = db_config.get_mongodb()
+                if not mongodb:
+                    raise RuntimeError("MongoDB client not available")
+                    
+                db = mongodb[os.getenv("DATABASE_NAME", "arogo_bhasini2")]
+                global consultations_collection
+                consultations_collection = db.consultations
+                
                 # Get Redis client after initialization
                 self.redis_client = db_config.get_redis()
                 if not self.redis_client:
@@ -204,10 +219,17 @@ class ConnectionManager:
                 await self.chat_service.initialize()
                 
                 self.initialized = True
-                logger.info("WebSocket manager initialized successfully")
+                logger.info("""
+                WebSocket Manager Initialized:
+                - Database connections established
+                - Collections configured
+                - Services ready
+                """)
+                
             except Exception as e:
                 logger.error(f"WebSocket initialization error: {str(e)}")
                 raise
+
     
     async def _cache_session_data(self, session_id: str, state: ConnectionState):
         """Cache session data in Redis with proper error handling"""
@@ -252,7 +274,6 @@ class ConnectionManager:
             )
             raise RuntimeError(f"Session caching failed: {str(e)}")
 
-
           
     async def connect(
         self,
@@ -260,45 +281,75 @@ class ConnectionManager:
         consultation_id: str,
         language_preferences: Dict
     ):
-        """Handle new WebSocket connection with enhanced error handling"""
+        """Handle new WebSocket connection with consultation context and error handling"""
         try:
             if not self.initialized:
                 await self.initialize()
 
             await websocket.accept()
-            
+
+            # Get consultation data for context
+            db_config = DatabaseConfig()
+            await db_config.initialize()
+            await db_config._initialized.wait()
+
+            consultation_data = await consultations_collection.find_one(
+                {"consultation_id": consultation_id}
+            )
+
+            if consultation_data:
+                # Use stored language preferences from consultation
+                stored_preferences = consultation_data.get("language_preferences", {})
+                language_preferences = stored_preferences
+                
+                # Get user details for context
+                user_details = consultation_data.get("user_details", {})
+            else:
+                user_details = {}
+
             # Validate language preferences
             preferred_language = language_preferences.get('preferred', 'en')
             if not LanguageMetadata.is_language_supported(preferred_language):
                 raise ValueError(f"Unsupported language: {preferred_language}")
-            
-            # Create connection state
+
+            # Create connection state with full context
             state = ConnectionState(
                 websocket=websocket,
                 language_preferences=language_preferences,
-                last_activity=datetime.utcnow()
+                last_activity=datetime.utcnow(),
+                user_details=user_details,
+                context_id=consultation_id,
+                original_language=preferred_language,
+                language_path="english_direct" if preferred_language == "en" else "translation"
             )
-            
+
             # Store connection state
             self.active_connections[consultation_id] = state
-            
+
             # Initialize language group
             if preferred_language not in self.language_groups:
                 self.language_groups[preferred_language] = set()
             self.language_groups[preferred_language].add(consultation_id)
-            
-            # Cache session data
+
+            # Cache session data with language context
             await self._cache_session_data(consultation_id, state)
-            
-            # Send welcome message
+
+            # Send welcome message in preferred language
             await self._send_welcome_message(consultation_id)
-            
-            logger.info(f"WebSocket connected: {consultation_id}")
-            
+
+            logger.info(f"""
+            WebSocket Connected:
+            Consultation ID: {consultation_id}
+            Language: {preferred_language}
+            Processing Path: {state.language_path}
+            User: {user_details.get('first_name', 'Patient')}
+            """)
+
         except Exception as e:
             logger.error(f"Connection error: {str(e)}")
             await self.disconnect(consultation_id)
             raise
+
 
     async def process_message(self, consultation_id: str, message: WebSocketMessage):
         """Process messages following our flow:
@@ -813,7 +864,6 @@ class ConnectionManager:
             )
             return []
 
-
     async def _send_response(
         self,
         consultation_id: str,
@@ -831,7 +881,7 @@ class ConnectionManager:
         self,
         consultation_id: str
     ):
-        """Send localized welcome message"""
+        """Send localized welcome message with audio"""
         try:
             state = self.active_connections[consultation_id]
             target_language = state.language_preferences['preferred']
@@ -839,16 +889,18 @@ class ConnectionManager:
             # Generate welcome message in English
             welcome_text = "Welcome to your medical consultation. How can I help you today?"
             
-            # Translate if needed
-            if target_language != "en":
-                translated = await self.chat_service.translate_to_language(
-                    text=welcome_text,
-                    source_language="en",
-                    target_language=target_language
-                )
-                welcome_text = translated["text"]
+            # Process output with translation and speech generation
+            processed_output = await self.speech_processor.process_output(
+                input_text=welcome_text,
+                english_text=welcome_text,
+                target_language=target_language,
+                generate_speech=True  # Enable speech generation
+            )
             
-            # Send welcome message
+            welcome_text = processed_output.get("translated_text", welcome_text)
+            audio_data = processed_output.get("audio_data")
+            
+            # Send welcome message with audio
             welcome = WebSocketResponse(
                 type="welcome",
                 content=welcome_text,
@@ -856,15 +908,19 @@ class ConnectionManager:
                     'code': target_language,
                     'name': LanguageMetadata.get_language_name(target_language)
                 },
+                audio=audio_data,  # Include audio data
                 metadata={
-                    'timestamp': datetime.utcnow().isoformat()
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'has_audio': bool(audio_data)
                 }
             )
             
             await self._send_response(consultation_id, welcome)
+            logger.info(f"Welcome message sent with audio in {target_language}")
             
         except Exception as e:
             logger.error(f"Error sending welcome message: {str(e)}")
+
 
     async def disconnect(self, consultation_id: str):
         """Handle WebSocket disconnection with cleanup"""
@@ -891,16 +947,18 @@ class ConnectionManager:
     async def _cleanup_session_data(self, consultation_id: str):
         """Cleanup session data from Redis"""
         try:
-            keys_to_delete = [
-                f"{self.redis_prefix}session:{consultation_id}",
-                f"{self.redis_prefix}context:{consultation_id}"
-            ]
-            
-            for key in keys_to_delete:
-                await redis_client.delete(key)
+            if self.redis_client:
+                keys_to_delete = [
+                    f"{self.redis_prefix}session:{consultation_id}",
+                    f"{self.redis_prefix}context:{consultation_id}"
+                ]
                 
+                for key in keys_to_delete:
+                    await self.redis_client.delete(key)
+                    
         except Exception as e:
             logger.error(f"Cleanup error: {str(e)}")
+
 
     # In websocket.py - modify existing _cache_session_data method
     async def _cache_session_data(self, session_id: str, state: ConnectionState):
@@ -1013,6 +1071,7 @@ class ConnectionManager:
 # Global manager instance
 manager = ConnectionManager()
 
+
 @router.websocket("/ws/{consultation_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -1025,24 +1084,35 @@ async def websocket_endpoint(
         if not manager.initialized:
             await manager.initialize()
         
-        # Connect new client with sanitized data handling
+        consultation_data = await consultations_collection.find_one(
+            {"consultation_id": consultation_id}
+        )
+        
+        if consultation_data:
+            # Use stored language preferences from consultation
+            stored_preferences = consultation_data.get("language_preferences", {})
+            language_preferences = stored_preferences
+        else:
+            language_preferences = language_preferences or {'preferred': 'en', 'interface': 'en'}
+
+        # Connect new client with consultation context
         try:
             await manager.connect(
-                websocket,
-                consultation_id,
-                language_preferences or {'preferred': 'en'}
+                websocket=websocket,
+                consultation_id=consultation_id,
+                language_preferences=language_preferences
             )
-        
-        # Main message processing loop
+
+            # Main message processing loop
             while True:
                 try:
                     # Receive and process messages
                     data = await websocket.receive_text()
                     message = WebSocketMessage.parse_raw(data)
-                    
+
                     # Process message with error handling
                     await manager.process_message(consultation_id, message)
-                    
+
                 except WebSocketDisconnect:
                     logger.info(f"WebSocket disconnected: {consultation_id}")
                     await manager.disconnect(consultation_id)
@@ -1051,7 +1121,7 @@ async def websocket_endpoint(
                 except json.JSONDecodeError as je:
                     logger.error(f"Invalid message format: {str(je)}")
                     continue
-                    
+
                 except Exception as message_error:
                     logger.error(f"Message processing error: {str(message_error)}")
                     # Send error message to client if possible
@@ -1062,12 +1132,12 @@ async def websocket_endpoint(
                         })
                     except:
                         pass
-            
+
         except Exception as conn_error:
-                logger.error(f"Connection error: {str(conn_error)}")
-                await manager.disconnect(consultation_id)
-                raise
-            
+            logger.error(f"Connection error: {str(conn_error)}")
+            await manager.disconnect(consultation_id)
+            raise
+
     except Exception as e:
         logger.error(f"WebSocket error: {str(e)}")
         try:
@@ -1082,7 +1152,7 @@ async def websocket_endpoint(
         except Exception as cleanup_error:
             logger.error(f"Cleanup error: {str(cleanup_error)}")
 
-# Initialize and cleanup functions remain unchanged
+# Initialize and cleanup functions
 async def initialize_manager():
     """Initialize WebSocket manager"""
     await manager.initialize()

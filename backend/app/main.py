@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Store client sessions
+    app.state.client_sessions = set()
+    
     # Startup
     try:
         logger.info("Starting up the application...")
@@ -63,6 +66,19 @@ async def lifespan(app: FastAPI):
     # Shutdown
     try:
         logger.info("Shutting down the application...")
+        
+        # Close all client sessions
+        if hasattr(app.state, 'client_sessions'):
+            await asyncio.gather(*[
+                session.close() 
+                for session in app.state.client_sessions
+            ], return_exceptions=True)
+            logger.info("Client sessions closed")
+        
+        # Cleanup chat service
+        if chat_service:
+            await chat_service.cleanup()
+            logger.info("Chat service cleaned up")
         
         # Cleanup database connections
         await DatabaseConfig.cleanup()
@@ -113,8 +129,14 @@ app.include_router(
 
 app.include_router(
     summary.router,
-    prefix="/api/summary",
+    prefix="/api/consultation",
     tags=["summary"]
+)
+
+app.include_router(
+    summary.router,
+    prefix="/api/diagnostic",
+    tags=["diagnostic"]
 )
 
 app.include_router(

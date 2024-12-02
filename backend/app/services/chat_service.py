@@ -324,6 +324,8 @@ class ChatService:
                 },
                 medical_context={
                     "user_details": {
+                        "first_name": user_details.get("first_name"), 
+                        "last_name": user_details.get("last_name"), 
                         "age": user_details.get("age"),
                         "gender": user_details.get("gender"),
                         "vitals": user_details.get("vitals", {})
@@ -540,8 +542,7 @@ class ChatService:
     Processing Stage: {locals().get('current_stage', 'unknown')}
                 """, exc_info=True)
                 raise RuntimeError(f"Message processing failed: {str(e)}")
-
-
+            
 
     async def _generate_ai_response(
         self,
@@ -581,7 +582,7 @@ class ChatService:
                 Example: "Hello {first_name} To better understand your condition, could you tell me..."
                 
                 RULES:
-                - Warm, professional greeting using patient's name
+                - Use patient's actual name: {first_name}
                 - ONE focused question
                 - No medical advice yet
                 - Response under 50 words
@@ -606,6 +607,7 @@ class ChatService:
                 Professional but accessible language
                 
                 RULES:
+                - Do no include any special characters
                 - Structured assessment
                 - Clear recommendations
                 - Include urgency level
@@ -782,12 +784,12 @@ class ChatService:
             if self.redis_client:
                 try:
                     # Clean up context data
-                    context_pattern = f"{self.context_prefix}*"
+                    context_pattern = f"{self.PREFIXES['context']}*"
                     async for key in self.redis_client.scan_iter(context_pattern):
                         await self.redis_client.delete(key)
                         
                     # Clean up session data
-                    session_pattern = f"{self.session_prefix}*"
+                    session_pattern = f"{self.PREFIXES['session']}*"
                     async for key in self.redis_client.scan_iter(session_pattern):
                         await self.redis_client.delete(key)
                     

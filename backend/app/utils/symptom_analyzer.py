@@ -9,8 +9,10 @@ import asyncio
 from functools import lru_cache
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
-import datetime
+from datetime import datetime, timezone
 from typing import Set
+import re
+
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +109,7 @@ class SymptomAnalyzer:
                 "emergency_indicators": analysis.get("emergency_signals", []),
                 "confidence": analysis.get("confidence", 0.0),
                 "ner_validated": bool(medical_entities),
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
             
             # Cache the result
@@ -132,7 +134,7 @@ class SymptomAnalyzer:
             cached = self.analysis_cache[key]
             cache_time = datetime.fromisoformat(cached["timestamp"])
             
-            if datetime.utcnow() - cache_time < self.cache_ttl:
+            if datetime.now(timezone.utc) - cache_time < self.cache_ttl:
                 return cached
             
             # Remove expired cache
@@ -144,7 +146,7 @@ class SymptomAnalyzer:
         self.analysis_cache[key] = analysis
         
         # Clean old cache entries
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc)
         expired_keys = [
             k for k, v in self.analysis_cache.items()
             if current_time - datetime.fromisoformat(v["timestamp"]) >= self.cache_ttl
@@ -306,6 +308,102 @@ class SymptomAnalyzer:
             return set(json.loads(response.text if hasattr(response, 'text') else '[]'))
         except:
             return terms
+        
+    
+    async def validate_medical_response(self, analysis_text: str, chat_history: List[Dict]) -> Dict:
+        """Validate medical response with enhanced error handling and response validation"""
+        try:
+            # Extract and validate medical terms
+            terms = set(re.findall(r'\b\w+\b', analysis_text))
+            validated_terms = self._validate_medical_relevance(terms)
+
+            # Prepare structured validation prompt
+            prompt = f"""
+            Analyze and validate this medical consultation:
+
+            ANALYSIS TEXT:
+            {analysis_text}
+
+            CONVERSATION HISTORY:
+            {self._extract_conversation_text(chat_history)}
+
+            VALIDATED MEDICAL TERMS:
+            {list(validated_terms)}
+
+            Provide a detailed validation focusing on:
+            1. Safety concerns and potential risks
+            2. Missing critical medical information
+            3. Required follow-up actions
+            4. Treatment compliance considerations
+
+            Return a JSON object with the following structure:
+            {{
+                "safety_concerns": [],
+                "suggested_improvements": [],
+                "critical_missing_info": [],
+                "follow_up_recommendations": []
+            }}
+            """
+
+            # Get AI validation
+            response = self.ai_config.model.generate_content(prompt)
+            response_text = response.text.strip()
+
+            # Process response with enhanced JSON handling
+            validation_result = {}
+            try:
+                # Handle different response formats
+                if '```json' in response_text:
+                    json_text = response_text.split('```json')[1].split('```')[0]
+                elif response_text.startswith('{'):
+                    json_text = response_text
+                else:
+                    json_text = response_text.split('{')[1].rsplit('}', 1)[0]
+                    json_text = '{' + json_text + '}'
+                
+                validation_result = json.loads(json_text)
+
+            except (json.JSONDecodeError, IndexError):
+                logger.warning("JSON parsing failed, using default structure")
+                validation_result = {
+                    "safety_concerns": [],
+                    "suggested_improvements": [],
+                    "critical_missing_info": [],
+                    "follow_up_recommendations": []
+                }
+
+            # Enhance validation with NER results
+            ner_entities = await self._process_ner(analysis_text)
+            critical_terms = [
+                entity["term"] for entity in ner_entities 
+                if entity["confidence"] > 0.85
+            ]
+
+            # Construct final response
+            return {
+                "safety_concerns": validation_result.get("safety_concerns", []),
+                "suggested_improvements": validation_result.get("suggested_improvements", []),
+                "critical_missing_info": validation_result.get("critical_missing_info", []),
+                "follow_up_recommendations": validation_result.get("follow_up_recommendations", []),
+                "validated_terms": list(validated_terms),
+                "critical_terms": critical_terms,
+                "validation_confidence": sum(entity["confidence"] for entity in ner_entities) / len(ner_entities) if ner_entities else 0.5,
+                "validation_timestamp": datetime.now(timezone.utc).isoformat()
+            }
+
+        except Exception as e:
+            logger.error(f"Medical response validation error: {str(e)}")
+            return {
+                "safety_concerns": [],
+                "suggested_improvements": [],
+                "critical_missing_info": [],
+                "follow_up_recommendations": [],
+                "validated_terms": list(validated_terms) if 'validated_terms' in locals() else [],
+                "critical_terms": [],
+                "validation_confidence": 0.0,
+                "validation_timestamp": datetime.now(timezone.utc).isoformat()
+            }
+
 
 
     async def _analyze_severity(self, text: str) -> Dict:
@@ -347,7 +445,7 @@ class SymptomAnalyzer:
                 "time_sensitivity": severity_analysis.get("time_sensitivity", "routine"),
                 "critical_symptoms": [symptom["term"] for symptom in critical_symptoms],
                 "confidence": sum(entity["confidence"] for entity in critical_symptoms) / len(critical_symptoms) if critical_symptoms else 0.5,
-                "analysis_timestamp": datetime.utcnow().isoformat()
+                "analysis_timestamp": datetime.now(timezone.utc).isoformat()
             }
 
         except json.JSONDecodeError:
@@ -355,6 +453,24 @@ class SymptomAnalyzer:
             return self._get_default_severity()
         except Exception as e:
             logger.error(f"Severity analysis error: {str(e)}")
+            return self._get_default_severity()
+        
+    async def get_severity_assessment(self, symptoms: List[Dict]) -> Dict:
+        """Get severity assessment using existing _analyze_severity method"""
+        try:
+            # Convert symptoms list to text format for analysis
+            symptoms_text = " ".join([symptom.get("term", "") for symptom in symptoms])
+            
+            # Use existing severity analysis
+            severity_result = await self._analyze_severity(symptoms_text)
+            
+            return {
+                "overall_severity": severity_result["severity_score"],
+                "risk_level": severity_result["urgency_level"],
+                "recommended_timeframe": severity_result["time_sensitivity"]
+            }
+        except Exception as e:
+            logger.error(f"Severity assessment error: {str(e)}")
             return self._get_default_severity()
 
     def _get_default_severity(self) -> Dict:
@@ -366,7 +482,7 @@ class SymptomAnalyzer:
             "time_sensitivity": "routine",
             "critical_symptoms": [],
             "confidence": 0.5,
-            "analysis_timestamp": datetime.utcnow().isoformat()
+            "analysis_timestamp": datetime.now(timezone.utc).isoformat()
         }
 
     def _determine_emergency_level(
@@ -394,6 +510,67 @@ class SymptomAnalyzer:
             return torch.cuda.is_available()
         except:
             return False
+        
+    async def get_treatment_recommendations(self, symptoms: List[Dict]) -> Dict:
+        """Get treatment recommendations for identified symptoms"""
+        try:
+            symptoms_text = " ".join([symptom.get("term", "") for symptom in symptoms])
+            
+            prompt = f"""
+            Provide treatment recommendations for these symptoms:
+            {symptoms_text}
+
+            Return a JSON with these exact fields:
+            {{
+                "medications": [],
+                "homeRemedies": []
+            }}
+            """
+
+            response = self.ai_config.model.generate_content(prompt)
+            recommendations = json.loads(response.text)
+
+            med_terms = set()
+            for med in recommendations.get("medications", []):
+                med_terms.add(med)
+            
+            validated_meds = self._validate_medical_relevance(med_terms)
+
+            return {
+                "medications": list(validated_meds),
+                "homeRemedies": recommendations.get("homeRemedies", [])
+            }
+
+
+        except Exception as e:
+            logger.error(f"Treatment recommendations error: {str(e)}")
+            return {
+                "medications": [],
+                "homeRemedies": []
+            }
+        
+    async def recommend_specialist(self, symptoms: List[Dict]) -> str:
+        """Recommend medical specialist based on symptoms"""
+        try:
+            symptoms_text = " ".join([symptom.get("term", "") for symptom in symptoms])
+            
+            prompt = f"""
+            Based on these symptoms, recommend the most appropriate medical specialist:
+            {symptoms_text}
+            
+            Return only the specialist type as a single string (e.g. 'Cardiologist', 'General Physician', etc.)
+            """
+
+            response = self.ai_config.model.generate_content(prompt)
+            specialist = response.text.strip().strip('"\'')
+            
+            return specialist if specialist else "General Physician"
+
+        except Exception as e:
+            logger.error(f"Specialist recommendation error: {str(e)}")
+            return "General Physician"
+
+
 
     async def cleanup(self):
         """Cleanup resources"""

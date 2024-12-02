@@ -145,10 +145,9 @@ const ChatInterface = () => {
 
     // Add minimum recording duration
     const startTime = Date.now();
-    const minRecordingDuration = 2000; // 3 seconds minimum
+    const minRecordingDuration = 3000; // 3 seconds minimum
 
     analyser.minDecibels = minDecibels;
-    
 
     microphone.connect(analyser);
     analyser.connect(scriptProcessor);

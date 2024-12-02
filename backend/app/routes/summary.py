@@ -1,11 +1,12 @@
 # backend/app/routes/summary.py
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from app.config.database import consultations_collection
+from app.config.database import consultations_collection, DatabaseConfig, mongodb_client, initialize_db
 from app.utils.symptom_analyzer import SymptomAnalyzer
 from app.config.language_metadata import LanguageMetadata
 from datetime import datetime
 import logging
 from typing import Dict, Optional
+import os
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -13,18 +14,41 @@ router = APIRouter()
 # Initialize services
 symptom_analyzer = SymptomAnalyzer()
 
+@router.on_event("startup")
+async def startup_event():
+    logger.info("Starting summary route initialization")
+    db_config = DatabaseConfig()
+    await db_config.initialize()
+    await db_config._initialized.wait()
+    logger.info("Database initialization completed")
+
 @router.get("/summary/{consultation_id}")
 async def get_consultation_summary(
     consultation_id: str,
     language: Optional[str] = None,
     include_analysis: bool = True
 ):
+    # Initialize database configuration
+    db_config = DatabaseConfig()
+    await db_config.initialize()
+    await db_config._initialized.wait()
+    
+    # Get MongoDB client and database
+    mongodb = db_config.get_mongodb()
+    if not mongodb:
+        raise HTTPException(status_code=503, detail="Database service unavailable")
+        
+    database_name = os.getenv("DATABASE_NAME")
+    database = mongodb[database_name]
+    consultations = database.consultations
+    
+    # Get consultation data
+    consultation = await consultations.find_one(
+        {"consultation_id": consultation_id}
+    )
+    
     """Get consultation summary and generate diagnosis."""
     try:
-        consultation = await consultations_collection.find_one(
-            {"consultation_id": consultation_id}
-        )
-        
         if not consultation:
             raise HTTPException(status_code=404, detail="Consultation not found")
         
@@ -92,7 +116,7 @@ async def get_consultation_summary(
                 summary = await _translate_summary(summary, preferred_language)
             
             # Update consultation with summary
-            await consultations_collection.update_one(
+            await consultations.update_one(
                 {"consultation_id": consultation_id},
                 {
                     "$set": {
@@ -112,6 +136,7 @@ async def get_consultation_summary(
     except Exception as e:
         logger.error(f"Error generating consultation summary: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/quick-summary/{consultation_id}")
 async def get_quick_summary(
